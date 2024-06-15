@@ -1,6 +1,7 @@
 defmodule BlockScoutWeb.API.RPC.ContractControllerTest do
   use BlockScoutWeb.ConnCase
   alias Explorer.Chain.SmartContract
+  alias Explorer.TestHelper
 
   import Mox
 
@@ -525,7 +526,7 @@ defmodule BlockScoutWeb.API.RPC.ContractControllerTest do
         }
       ]
 
-      get_implementation()
+      TestHelper.get_eip1967_implementation_zero_addresses()
 
       assert response =
                conn
@@ -572,7 +573,7 @@ defmodule BlockScoutWeb.API.RPC.ContractControllerTest do
         }
       ]
 
-      get_implementation()
+      TestHelper.get_eip1967_implementation_zero_addresses()
 
       assert response =
                conn
@@ -676,7 +677,7 @@ defmodule BlockScoutWeb.API.RPC.ContractControllerTest do
         }
       ]
 
-      get_implementation()
+      TestHelper.get_eip1967_implementation_zero_addresses()
 
       assert response =
                conn
@@ -742,7 +743,7 @@ defmodule BlockScoutWeb.API.RPC.ContractControllerTest do
         "addressHash" => "0xf26594F585De4EB0Ae9De865d9053FEe02ac6eF1"
       }
 
-      get_implementation()
+      TestHelper.get_eip1967_implementation_zero_addresses()
 
       conn
       |> get("/api", params)
@@ -860,6 +861,63 @@ defmodule BlockScoutWeb.API.RPC.ContractControllerTest do
     # end
   end
 
+  describe "getcontractcreation" do
+    setup do
+      %{params: %{"module" => "contract", "action" => "getcontractcreation"}}
+    end
+
+    test "return error", %{conn: conn, params: params} do
+      %{
+        "status" => "0",
+        "message" => "Query parameter contractaddresses is required",
+        "result" => "Query parameter contractaddresses is required"
+      } =
+        conn
+        |> get("/api", params)
+        |> json_response(200)
+    end
+
+    test "get empty list", %{conn: conn, params: params} do
+      address = build(:address)
+      address_1 = insert(:address)
+
+      %{
+        "status" => "1",
+        "message" => "OK",
+        "result" => []
+      } =
+        conn
+        |> get("/api", Map.put(params, "contractaddresses", "#{to_string(address)},#{to_string(address_1)}"))
+        |> json_response(200)
+    end
+
+    test "get not empty list", %{conn: conn, params: params} do
+      address_1 = build(:address)
+      address = insert(:contract_address)
+
+      transaction = insert(:transaction, created_contract_address: address)
+
+      %{
+        "status" => "1",
+        "message" => "OK",
+        "result" => [
+          %{
+            "contractAddress" => contract_address,
+            "contractCreator" => contract_creator,
+            "txHash" => tx_hash
+          }
+        ]
+      } =
+        conn
+        |> get("/api", Map.put(params, "contractaddresses", "#{to_string(address)},#{to_string(address_1)}"))
+        |> json_response(200)
+
+      assert contract_address == to_string(address.hash)
+      assert contract_creator == to_string(transaction.from_address_hash)
+      assert tx_hash == to_string(transaction.hash)
+    end
+  end
+
   defp listcontracts_schema do
     resolve_schema(%{
       "type" => ["array", "null"],
@@ -927,57 +985,5 @@ defmodule BlockScoutWeb.API.RPC.ContractControllerTest do
     }
     |> put_in(["properties", "result"], result)
     |> ExJsonSchema.Schema.resolve()
-  end
-
-  def get_implementation do
-    EthereumJSONRPC.Mox
-    |> expect(:json_rpc, fn %{
-                              id: 0,
-                              method: "eth_getStorageAt",
-                              params: [
-                                _,
-                                "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc",
-                                "latest"
-                              ]
-                            },
-                            _options ->
-      {:ok, "0x0000000000000000000000000000000000000000000000000000000000000000"}
-    end)
-    |> expect(:json_rpc, fn %{
-                              id: 0,
-                              method: "eth_getStorageAt",
-                              params: [
-                                _,
-                                "0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50",
-                                "latest"
-                              ]
-                            },
-                            _options ->
-      {:ok, "0x0000000000000000000000000000000000000000000000000000000000000000"}
-    end)
-    |> expect(:json_rpc, fn %{
-                              id: 0,
-                              method: "eth_getStorageAt",
-                              params: [
-                                _,
-                                "0x7050c9e0f4ca769c69bd3a8ef740bc37934f8e2c036e5a723fd8ee048ed3f8c3",
-                                "latest"
-                              ]
-                            },
-                            _options ->
-      {:ok, "0x0000000000000000000000000000000000000000000000000000000000000000"}
-    end)
-    |> expect(:json_rpc, fn %{
-                              id: 0,
-                              method: "eth_getStorageAt",
-                              params: [
-                                _,
-                                "0xc5f16f0fcc639fa48a6947836d9850f504798523bf8c9a3a87d5876cf622bcf7",
-                                "latest"
-                              ]
-                            },
-                            _options ->
-      {:ok, "0x0000000000000000000000000000000000000000000000000000000000000000"}
-    end)
   end
 end

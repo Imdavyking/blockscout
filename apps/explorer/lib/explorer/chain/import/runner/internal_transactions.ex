@@ -145,18 +145,18 @@ defmodule Explorer.Chain.Import.Runner.InternalTransactions do
         :update_transactions
       )
     end)
-    |> Multi.run(:remove_consensus_of_invalid_blocks, fn repo, %{invalid_block_numbers: invalid_block_numbers} ->
+    |> Multi.run(:set_refetch_needed_for_invalid_blocks, fn repo, %{invalid_block_numbers: invalid_block_numbers} ->
       Instrumenter.block_import_stage_runner(
-        fn -> remove_consensus_of_invalid_blocks(repo, invalid_block_numbers) end,
+        fn -> set_refetch_needed_for_invalid_blocks(repo, invalid_block_numbers, timestamps) end,
         :block_pending,
         :internal_transactions,
-        :remove_consensus_of_invalid_blocks
+        :set_refetch_needed_for_invalid_blocks
       )
     end)
     |> Multi.run(:update_pending_blocks_status, fn repo,
                                                    %{
                                                      acquire_pending_internal_txs: pending_block_hashes,
-                                                     remove_consensus_of_invalid_blocks: invalid_block_hashes
+                                                     set_refetch_needed_for_invalid_blocks: invalid_block_hashes
                                                    } ->
       Instrumenter.block_import_stage_runner(
         fn -> update_pending_blocks_status(repo, pending_block_hashes, invalid_block_hashes) end,
@@ -322,7 +322,7 @@ defmodule Explorer.Chain.Import.Runner.InternalTransactions do
   end
 
   defp invalid_block_numbers(transactions, internal_transactions_params) do
-    # Finds all mistmatches between transactions and internal transactions
+    # Finds all mismatches between transactions and internal transactions
     # for a block number:
     # - there are no internal txs for some transactions
     # - there are internal txs with a different block number than their transactions
@@ -333,6 +333,10 @@ defmodule Explorer.Chain.Import.Runner.InternalTransactions do
     # common_tuples = MapSet.intersection(required_tuples, candidate_tuples) #should be added
     # |> MapSet.difference(internal_transactions_tuples) should be replaced with |> MapSet.difference(common_tuples)
 
+    # Note: for zetachain or if empty traces are explicitly allowed,
+    # the case "# - there are no internal txs for some transactions" is removed since
+    # there are may be non-traceable transactions
+
     transactions_tuples = MapSet.new(transactions, &{&1.hash, &1.block_number})
 
     internal_transactions_tuples = MapSet.new(internal_transactions_params, &{&1.transaction_hash, &1.block_number})
@@ -340,16 +344,35 @@ defmodule Explorer.Chain.Import.Runner.InternalTransactions do
     all_tuples = MapSet.union(transactions_tuples, internal_transactions_tuples)
 
     invalid_block_numbers =
-      all_tuples
-      |> MapSet.difference(internal_transactions_tuples)
-      |> MapSet.new(fn {_hash, block_number} -> block_number end)
-      |> MapSet.to_list()
+      if allow_non_traceable_transactions?() do
+        Enum.reduce(internal_transactions_tuples, [], fn {transaction_hash, block_number}, acc ->
+          # credo:disable-for-next-line
+          case Enum.find(transactions_tuples, fn {t_hash, _block_number} -> t_hash == transaction_hash end) do
+            nil -> acc
+            {_t_hash, ^block_number} -> acc
+            _ -> [block_number | acc]
+          end
+        end)
+      else
+        all_tuples
+        |> MapSet.difference(internal_transactions_tuples)
+        |> MapSet.new(fn {_hash, block_number} -> block_number end)
+        |> MapSet.to_list()
+      end
 
     {:ok, invalid_block_numbers}
   end
 
+  defp allow_non_traceable_transactions? do
+    Application.get_env(:explorer, :chain_type) == :zetachain or
+      (Application.get_env(:explorer, :json_rpc_named_arguments)[:variant] == EthereumJSONRPC.Geth and
+         Application.get_env(:ethereum_jsonrpc, EthereumJSONRPC.Geth)[:allow_empty_traces?])
+  end
+
   defp valid_internal_transactions(transactions, internal_transactions_params, invalid_block_numbers) do
-    if Enum.count(transactions) > 0 do
+    if Enum.empty?(transactions) do
+      {:ok, []}
+    else
       blocks_map = Map.new(transactions, &{&1.block_number, &1.block_hash})
 
       valid_internal_txs =
@@ -361,8 +384,6 @@ defmodule Explorer.Chain.Import.Runner.InternalTransactions do
         end)
 
       {:ok, valid_internal_txs}
-    else
-      {:ok, []}
     end
   end
 
@@ -381,7 +402,9 @@ defmodule Explorer.Chain.Import.Runner.InternalTransactions do
       block_hash = Map.fetch!(blocks_map, block_number)
 
       entries
-      |> Enum.sort_by(&{&1.transaction_hash, &1.index})
+      |> Enum.sort_by(
+        &{(Map.has_key?(&1, :transaction_index) && &1.transaction_index) || &1.transaction_hash, &1.index}
+      )
       |> Enum.with_index()
       |> Enum.map(fn {entry, index} ->
         entry
@@ -645,6 +668,7 @@ defmodule Explorer.Chain.Import.Runner.InternalTransactions do
       updated_at: timestamps.updated_at
     ]
 
+    # we don't save reverted trace outputs, but if we did, we could also set :revert_reason here
     set =
       default_set
       |> put_status_in_update_set(first_trace, transaction_from_db)
@@ -691,21 +715,22 @@ defmodule Explorer.Chain.Import.Runner.InternalTransactions do
     end
   end
 
-  defp remove_consensus_of_invalid_blocks(repo, invalid_block_numbers) do
-    if Enum.count(invalid_block_numbers) > 0 do
-      update_query =
+  defp set_refetch_needed_for_invalid_blocks(repo, invalid_block_numbers, %{updated_at: updated_at}) do
+    if Enum.empty?(invalid_block_numbers) do
+      {:ok, []}
+    else
+      update_block_query =
         from(
           block in Block,
           where: block.number in ^invalid_block_numbers and block.consensus == true,
           where: ^traceable_blocks_dynamic_query(),
           select: block.hash,
           # ShareLocks order already enforced by `acquire_blocks` (see docs: sharelocks.md)
-          update: [set: [consensus: false]]
+          update: [set: [refetch_needed: true, updated_at: ^updated_at]]
         )
 
       try do
-        {_num, result} = repo.update_all(update_query, [])
-
+        {_num, result} = repo.update_all(update_block_query, [])
         MissingRangesManipulator.add_ranges_by_block_numbers(invalid_block_numbers)
 
         Logger.debug(fn ->
@@ -721,8 +746,6 @@ defmodule Explorer.Chain.Import.Runner.InternalTransactions do
         postgrex_error in Postgrex.Error ->
           {:error, %{exception: postgrex_error, invalid_block_numbers: invalid_block_numbers}}
       end
-    else
-      {:ok, []}
     end
   end
 
